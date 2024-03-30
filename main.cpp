@@ -21,6 +21,15 @@ SimpleBLE::Peripheral findCorBi(SimpleBLE::Adapter adaper);
 // TODO エラーハンドリングしっかり。
 
 SimpleBLE::Peripheral CorBiReader;
+outputMode mode = outputMode::ALL;
+
+enum class outputMode
+{
+    ALL,
+    IR,
+    RED,
+    IR_RED
+};
 
 void CorBiCore_exit()
 {
@@ -37,6 +46,18 @@ void userInputListener()
         if (input == "e")
         {
             exit(0);
+        }
+        else if (input == "0")
+            mode = outputMode::ALL;
+        else if (input == "1")
+            mode = outputMode::IR;
+        else if (input == "2")
+            mode = outputMode::RED;
+        else if (input == "3")
+            mode = outputMode::IR_RED;
+        else
+        {
+            std::cout << "Invalid input." << std::endl;
         }
     }
 }

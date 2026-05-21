@@ -65,7 +65,7 @@ public:
 
 private:
     static constexpr double SAMPLE_RATE_HZ = 100.0;
-    static constexpr size_t MIN_SAMPLES = 240;
+    static constexpr size_t MIN_SAMPLES = 180;
     static constexpr size_t WINDOW_SIZE = 400;
     static constexpr size_t MAX_INTERVALS = 8;
     static constexpr size_t MIN_BEAT_INTERVAL = static_cast<size_t>(SAMPLE_RATE_HZ * 60.0 / 220.0);
@@ -73,10 +73,10 @@ private:
     static constexpr size_t MAX_STALE_SAMPLES = static_cast<size_t>(SAMPLE_RATE_HZ * 3.0);
     static constexpr int MIN_BPM = 40;
     static constexpr int MAX_BPM = 220;
-    static constexpr double MIN_QUALITY = 0.28;
+    static constexpr double MIN_QUALITY = 0.16;
     static constexpr double DC_ALPHA = 0.01;
     static constexpr double FILTER_ALPHA = 0.18;
-    static constexpr double THRESHOLD_SCALE = 0.42;
+    static constexpr double THRESHOLD_SCALE = 0.30;
     static constexpr double BPM_SMOOTHING = 0.28;
 
     void processSample(uint16_t raw)
@@ -119,11 +119,11 @@ private:
         }
 
         const double rms = std::sqrt(energy / filteredWindow.size());
-        const double amplitudeQuality = clamp(peak / 650.0, 0.0, 1.0);
-        const double energyQuality = clamp(rms / 260.0, 0.0, 1.0);
+        const double amplitudeQuality = clamp(peak / 260.0, 0.0, 1.0);
+        const double energyQuality = clamp(rms / 120.0, 0.0, 1.0);
         const double intervalQuality = intervalConsistency();
-        quality = clamp((amplitudeQuality * 0.45) + (energyQuality * 0.25) + (intervalQuality * 0.30), 0.0, 1.0);
-        adaptiveThreshold = std::max(80.0, rms * THRESHOLD_SCALE);
+        quality = clamp((amplitudeQuality * 0.55) + (energyQuality * 0.30) + (intervalQuality * 0.15), 0.0, 1.0);
+        adaptiveThreshold = std::max(24.0, rms * THRESHOLD_SCALE);
     }
 
     void detectBeat(double current)

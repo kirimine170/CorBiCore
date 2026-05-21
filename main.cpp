@@ -7,6 +7,7 @@
 #include <cmath>
 #include <numeric>
 #include <atomic>
+#include <algorithm>
 
 #include <simpleble/SimpleBLE.h>
 
@@ -46,51 +47,185 @@ public:
     {
         for (uint16_t sample : samples)
         {
-            window.push_back(sample);
-            if (window.size() > WINDOW_SIZE)
-                window.pop_front();
+            processSample(sample);
         }
     }
 
     double estimateBpm() const
     {
-        if (window.size() < MIN_WINDOW_SIZE)
+        if (sampleIndex < MIN_SAMPLES || quality < MIN_QUALITY)
             return 0.0;
 
-        const double mean = std::accumulate(window.begin(), window.end(), 0.0) / window.size();
-        double best_bpm = 0.0;
-        double best_power = 0.0;
-        for (int bpm = MIN_BPM; bpm <= MAX_BPM; bpm++)
-        {
-            const double frequency = bpm / 60.0;
-            double real = 0.0;
-            double imag = 0.0;
-            for (size_t i = 0; i < window.size(); i++)
-            {
-                const double sample = static_cast<double>(window[i]) - mean;
-                const double angle = 2.0 * M_PI * frequency * static_cast<double>(i) / SAMPLE_RATE_HZ;
-                real += sample * std::cos(angle);
-                imag -= sample * std::sin(angle);
-            }
+        const size_t samplesSinceBeat = sampleIndex - lastBeatSample;
+        if (lastBeatSample == 0 || samplesSinceBeat > MAX_STALE_SAMPLES)
+            return 0.0;
 
-            const double power = real * real + imag * imag;
-            if (power > best_power)
-            {
-                best_power = power;
-                best_bpm = bpm;
-            }
-        }
-        return best_bpm;
+        return smoothedBpm;
     }
 
 private:
     static constexpr double SAMPLE_RATE_HZ = 100.0;
-    static constexpr size_t MIN_WINDOW_SIZE = 128;
-    static constexpr size_t WINDOW_SIZE = 256;
+    static constexpr size_t MIN_SAMPLES = 240;
+    static constexpr size_t WINDOW_SIZE = 400;
+    static constexpr size_t MAX_INTERVALS = 8;
+    static constexpr size_t MIN_BEAT_INTERVAL = static_cast<size_t>(SAMPLE_RATE_HZ * 60.0 / 220.0);
+    static constexpr size_t MAX_BEAT_INTERVAL = static_cast<size_t>(SAMPLE_RATE_HZ * 60.0 / 38.0);
+    static constexpr size_t MAX_STALE_SAMPLES = static_cast<size_t>(SAMPLE_RATE_HZ * 3.0);
     static constexpr int MIN_BPM = 40;
-    static constexpr int MAX_BPM = 300;
+    static constexpr int MAX_BPM = 220;
+    static constexpr double MIN_QUALITY = 0.28;
+    static constexpr double DC_ALPHA = 0.01;
+    static constexpr double FILTER_ALPHA = 0.18;
+    static constexpr double THRESHOLD_SCALE = 0.42;
+    static constexpr double BPM_SMOOTHING = 0.28;
 
-    std::deque<uint16_t> window;
+    void processSample(uint16_t raw)
+    {
+        sampleIndex++;
+        const double sample = static_cast<double>(raw);
+        if (!initialized)
+        {
+            dc = sample;
+            initialized = true;
+        }
+
+        dc += DC_ALPHA * (sample - dc);
+        filtered += FILTER_ALPHA * ((sample - dc) - filtered);
+
+        filteredWindow.push_back(filtered);
+        if (filteredWindow.size() > WINDOW_SIZE)
+            filteredWindow.pop_front();
+
+        updateQuality();
+        detectBeat(filtered);
+    }
+
+    void updateQuality()
+    {
+        if (filteredWindow.size() < MIN_SAMPLES)
+        {
+            quality = 0.0;
+            return;
+        }
+
+        double mean = std::accumulate(filteredWindow.begin(), filteredWindow.end(), 0.0) / filteredWindow.size();
+        double energy = 0.0;
+        double peak = 0.0;
+        for (double value : filteredWindow)
+        {
+            const double centered = value - mean;
+            energy += centered * centered;
+            peak = std::max(peak, std::abs(centered));
+        }
+
+        const double rms = std::sqrt(energy / filteredWindow.size());
+        const double amplitudeQuality = clamp(peak / 650.0, 0.0, 1.0);
+        const double energyQuality = clamp(rms / 260.0, 0.0, 1.0);
+        const double intervalQuality = intervalConsistency();
+        quality = clamp((amplitudeQuality * 0.45) + (energyQuality * 0.25) + (intervalQuality * 0.30), 0.0, 1.0);
+        adaptiveThreshold = std::max(80.0, rms * THRESHOLD_SCALE);
+    }
+
+    void detectBeat(double current)
+    {
+        if (filteredWindow.size() < MIN_SAMPLES)
+        {
+            previousPrevious = previous;
+            previous = current;
+            return;
+        }
+
+        const bool localMaximum = previous > previousPrevious && previous >= current;
+        const bool strongEnough = previous > adaptiveThreshold;
+        const size_t candidateSample = sampleIndex - 1;
+        const size_t interval = lastBeatSample == 0 ? 0 : candidateSample - lastBeatSample;
+        const bool outsideRefractory = lastBeatSample == 0 || interval >= MIN_BEAT_INTERVAL;
+
+        if (localMaximum && strongEnough && outsideRefractory)
+        {
+            if (lastBeatSample == 0 || interval <= MAX_BEAT_INTERVAL)
+            {
+                acceptBeat(candidateSample, interval);
+            }
+        }
+
+        previousPrevious = previous;
+        previous = current;
+    }
+
+    void acceptBeat(size_t beatSample, size_t interval)
+    {
+        if (interval == 0)
+        {
+            lastBeatSample = beatSample;
+            return;
+        }
+
+        const double intervalBpm = 60.0 * SAMPLE_RATE_HZ / static_cast<double>(interval);
+        if (intervalBpm >= MIN_BPM && intervalBpm <= MAX_BPM && isConsistent(interval))
+        {
+            beatIntervals.push_back(interval);
+            if (beatIntervals.size() > MAX_INTERVALS)
+                beatIntervals.pop_front();
+
+            const double bpm = 60.0 * SAMPLE_RATE_HZ / medianInterval();
+            smoothedBpm = smoothedBpm == 0.0 ? bpm : smoothedBpm + BPM_SMOOTHING * (bpm - smoothedBpm);
+            lastBeatSample = beatSample;
+        }
+    }
+
+    bool isConsistent(size_t interval) const
+    {
+        if (beatIntervals.size() < 3)
+            return true;
+
+        const double median = medianInterval();
+        const double deviation = std::abs(static_cast<double>(interval) - median) / median;
+        return deviation < 0.35;
+    }
+
+    double intervalConsistency() const
+    {
+        if (beatIntervals.size() < 3)
+            return 0.0;
+
+        const double median = medianInterval();
+        double error = 0.0;
+        for (size_t interval : beatIntervals)
+        {
+            error += std::abs(static_cast<double>(interval) - median) / median;
+        }
+        error /= beatIntervals.size();
+        return clamp(1.0 - (error / 0.22), 0.0, 1.0);
+    }
+
+    double medianInterval() const
+    {
+        std::vector<size_t> intervals(beatIntervals.begin(), beatIntervals.end());
+        std::sort(intervals.begin(), intervals.end());
+        const size_t middle = intervals.size() / 2;
+        if (intervals.size() % 2 == 0)
+            return (static_cast<double>(intervals[middle - 1]) + static_cast<double>(intervals[middle])) / 2.0;
+        return static_cast<double>(intervals[middle]);
+    }
+
+    static double clamp(double value, double minValue, double maxValue)
+    {
+        return std::min(maxValue, std::max(minValue, value));
+    }
+
+    bool initialized = false;
+    size_t sampleIndex = 0;
+    size_t lastBeatSample = 0;
+    double dc = 0.0;
+    double filtered = 0.0;
+    double previous = 0.0;
+    double previousPrevious = 0.0;
+    double adaptiveThreshold = 120.0;
+    double smoothedBpm = 0.0;
+    double quality = 0.0;
+    std::deque<double> filteredWindow;
+    std::deque<size_t> beatIntervals;
 };
 
 void CorBiCore_exit()

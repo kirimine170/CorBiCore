@@ -2,6 +2,7 @@
 #include <iostream>
 #include <thread>
 #include <iomanip>
+#include <atomic>
 
 #include <simpleble/SimpleBLE.h>
 
@@ -17,11 +18,10 @@ void print_byte_array_float(SimpleBLE::ByteArray array);
 void print_byte_array_uint16(SimpleBLE::ByteArray array);
 void print_byte_array_int(SimpleBLE::ByteArray array);
 SimpleBLE::Peripheral findCorBi(SimpleBLE::Adapter adaper);
+bool setOutputMode(const std::string &input);
+void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, SimpleBLE::ByteArray order_data);
 // TODO 接続周りはコールバックに変更。
 // TODO エラーハンドリングしっかり。
-
-SimpleBLE::Peripheral CorBiReader;
-outputMode mode = outputMode::ALL;
 
 enum class outputMode
 {
@@ -31,55 +31,68 @@ enum class outputMode
     IR_RED
 };
 
+SimpleBLE::Peripheral CorBiReader;
+std::atomic<outputMode> mode{outputMode::ALL};
+
 void CorBiCore_exit()
 {
     CorBiReader.disconnect();
-    std::cout << "CorBiCore is exit." << std::endl;
+    std::cerr << "CorBiCore is exit." << std::endl;
 }
 
 void userInputListener()
 {
     std::string input;
-    while (true)
+    while (std::cin >> input)
     {
-        std::cin >> input;
         if (input == "e")
         {
             exit(0);
         }
-        else if (input == "0")
-            mode = outputMode::ALL;
-        else if (input == "1")
-            mode = outputMode::IR;
-        else if (input == "2")
-            mode = outputMode::RED;
-        else if (input == "3")
-            mode = outputMode::IR_RED;
-        else
+        else if (!setOutputMode(input))
         {
-            std::cout << "Invalid input." << std::endl;
+            std::cerr << "Invalid input." << std::endl;
         }
     }
 }
 
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+        if ((arg == "--mode" || arg == "-m") && i + 1 < argc)
+        {
+            if (!setOutputMode(argv[++i]))
+            {
+                std::cerr << "Invalid mode: " << argv[i] << std::endl;
+                return 1;
+            }
+        }
+        else if (!setOutputMode(arg))
+        {
+            std::cerr << "Usage: CorBiCore [--mode all|ir|red|ir-red]" << std::endl;
+            return 1;
+        }
+    }
+
     std::atexit(CorBiCore_exit);
     std::thread inputThread(userInputListener);
+    inputThread.detach();
 
     for (;;) // FIXME 流石に関数として括り出した方がいいかも。connect関数とか、read関数とか。
     {
 
         if (!SimpleBLE::Adapter::bluetooth_enabled())
         {
-            std::cout << "Bluetooth is not enabled." << std::endl;
+            std::cerr << "Bluetooth is not enabled." << std::endl;
             return 1;
         }
 
         std::vector<SimpleBLE::Adapter> adapters = SimpleBLE::Adapter::get_adapters();
         if (adapters.empty())
         {
-            std::cout << "No BLE adapters found." << std::endl;
+            std::cerr << "No BLE adapters found." << std::endl;
             return 1;
         }
 
@@ -89,12 +102,23 @@ int main(int argc, char **argv)
         // std::cout << "Address: " << adapter.address() << std::endl;
 
         CorBiReader = findCorBi(adapter);
+        std::cerr << "CorBi found: " << CorBiReader.identifier() << " " << CorBiReader.address() << std::endl;
         if (CorBiReader.is_connectable())
+        {
+            std::cerr << "Connecting to CorBi..." << std::endl;
             CorBiReader.connect();
+        }
         else
+        {
+            std::cerr << "CorBi is not connectable." << std::endl;
             return 1;
+        }
         if (!CorBiReader.is_connected())
+        {
+            std::cerr << "Failed to connect to CorBi." << std::endl;
             return 1;
+        }
+        std::cerr << "Connected to CorBi." << std::endl;
         SimpleBLE::ByteArray old_data = "";
         for (;;)
         {
@@ -105,13 +129,7 @@ int main(int argc, char **argv)
                 SimpleBLE::ByteArray rx_data_IR = CorBiReader.read(SERVICE_PULSEOXIMETER_UUID, CHARA_IR_UUID);
                 if (rx_data_RED != old_data)
                 {
-
-                    print_byte_array_uint16(rx_data_IR);
-                    std::cout << " ";
-                    print_byte_array_uint16(rx_data_RED);
-                    std::cout << " ";
-                    print_byte_array_int(rx_data);
-                    std::cout << std::endl;
+                    print_current_data(rx_data_IR, rx_data_RED, rx_data);
                 }
                 old_data = rx_data_RED;
                 // print_byte_array_hex(rx_data);
@@ -126,6 +144,57 @@ int main(int argc, char **argv)
         // std::cout << "Connected to CorBi." << std::endl;
     }
     return 0;
+}
+
+bool setOutputMode(const std::string &input)
+{
+    if (input == "0" || input == "all")
+    {
+        mode = outputMode::ALL;
+        return true;
+    }
+    if (input == "1" || input == "ir")
+    {
+        mode = outputMode::IR;
+        return true;
+    }
+    if (input == "2" || input == "red")
+    {
+        mode = outputMode::RED;
+        return true;
+    }
+    if (input == "3" || input == "ir-red" || input == "ir_red")
+    {
+        mode = outputMode::IR_RED;
+        return true;
+    }
+    return false;
+}
+
+void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, SimpleBLE::ByteArray order_data)
+{
+    switch (mode.load())
+    {
+    case outputMode::IR:
+        print_byte_array_uint16(ir_data);
+        break;
+    case outputMode::RED:
+        print_byte_array_uint16(red_data);
+        break;
+    case outputMode::IR_RED:
+        print_byte_array_uint16(ir_data);
+        std::cout << " ";
+        print_byte_array_uint16(red_data);
+        break;
+    case outputMode::ALL:
+        print_byte_array_uint16(ir_data);
+        std::cout << " ";
+        print_byte_array_uint16(red_data);
+        std::cout << " ";
+        print_byte_array_int(order_data);
+        break;
+    }
+    std::cout << std::endl;
 }
 
 void print_byte_array_hex(SimpleBLE::ByteArray array)

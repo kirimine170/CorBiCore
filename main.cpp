@@ -6,6 +6,7 @@
 #include <vector>
 #include <cmath>
 #include <numeric>
+#include <atomic>
 
 #include <simpleble/SimpleBLE.h>
 
@@ -22,10 +23,21 @@ void print_byte_array_uint16(SimpleBLE::ByteArray array);
 void print_byte_array_int(SimpleBLE::ByteArray array);
 SimpleBLE::Peripheral findCorBi(SimpleBLE::Adapter adaper);
 std::vector<uint16_t> decode_uint16_samples(const SimpleBLE::ByteArray &array);
+bool setOutputMode(const std::string &input);
+void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, double heart_rate);
 // TODO 接続周りはコールバックに変更。
 // TODO エラーハンドリングしっかり。
 
+enum class outputMode
+{
+    ALL,
+    IR,
+    RED,
+    IR_RED
+};
+
 SimpleBLE::Peripheral CorBiReader;
+std::atomic<outputMode> mode{outputMode::ALL};
 
 class HeartRateEstimator
 {
@@ -87,9 +99,46 @@ void CorBiCore_exit()
     std::cerr << "CorBiCore is exit." << std::endl;
 }
 
+void userInputListener()
+{
+    std::string input;
+    while (std::cin >> input)
+    {
+        if (input == "e")
+        {
+            exit(0);
+        }
+        else if (!setOutputMode(input))
+        {
+            std::cerr << "Invalid input." << std::endl;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+        if ((arg == "--mode" || arg == "-m") && i + 1 < argc)
+        {
+            if (!setOutputMode(argv[++i]))
+            {
+                std::cerr << "Invalid mode: " << argv[i] << std::endl;
+                return 1;
+            }
+        }
+        else if (!setOutputMode(arg))
+        {
+            std::cerr << "Usage: CorBiCore [--mode all|ir|red|ir-red]" << std::endl;
+            return 1;
+        }
+    }
+
     std::atexit(CorBiCore_exit);
+    std::thread inputThread(userInputListener);
+    inputThread.detach();
+
     for (;;) // FIXME 流石に関数として括り出した方がいいかも。connect関数とか、read関数とか。
     {
 
@@ -112,12 +161,23 @@ int main(int argc, char **argv)
         // std::cout << "Address: " << adapter.address() << std::endl;
 
         CorBiReader = findCorBi(adapter);
+        std::cerr << "CorBi found: " << CorBiReader.identifier() << " " << CorBiReader.address() << std::endl;
         if (CorBiReader.is_connectable())
+        {
+            std::cerr << "Connecting to CorBi..." << std::endl;
             CorBiReader.connect();
+        }
         else
+        {
+            std::cerr << "CorBi is not connectable." << std::endl;
             return 1;
+        }
         if (!CorBiReader.is_connected())
+        {
+            std::cerr << "Failed to connect to CorBi." << std::endl;
             return 1;
+        }
+        std::cerr << "Connected to CorBi." << std::endl;
         SimpleBLE::ByteArray old_data = "";
         HeartRateEstimator heartRateEstimator;
         for (;;)
@@ -130,13 +190,7 @@ int main(int argc, char **argv)
                 if (rx_data_RED != old_data)
                 {
                     heartRateEstimator.addSamples(decode_uint16_samples(rx_data_IR));
-
-                    print_byte_array_uint16(rx_data_IR);
-                    std::cout << " ";
-                    print_byte_array_uint16(rx_data_RED);
-                    std::cout << " ";
-                    std::cout << std::fixed << std::setprecision(1) << heartRateEstimator.estimateBpm();
-                    std::cout << std::endl;
+                    print_current_data(rx_data_IR, rx_data_RED, heartRateEstimator.estimateBpm());
                 }
                 old_data = rx_data_RED;
                 // print_byte_array_hex(rx_data);
@@ -163,6 +217,57 @@ std::vector<uint16_t> decode_uint16_samples(const SimpleBLE::ByteArray &array)
         samples.push_back(number);
     }
     return samples;
+}
+
+bool setOutputMode(const std::string &input)
+{
+    if (input == "0" || input == "all")
+    {
+        mode = outputMode::ALL;
+        return true;
+    }
+    if (input == "1" || input == "ir")
+    {
+        mode = outputMode::IR;
+        return true;
+    }
+    if (input == "2" || input == "red")
+    {
+        mode = outputMode::RED;
+        return true;
+    }
+    if (input == "3" || input == "ir-red" || input == "ir_red")
+    {
+        mode = outputMode::IR_RED;
+        return true;
+    }
+    return false;
+}
+
+void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, double heart_rate)
+{
+    switch (mode.load())
+    {
+    case outputMode::IR:
+        print_byte_array_uint16(ir_data);
+        break;
+    case outputMode::RED:
+        print_byte_array_uint16(red_data);
+        break;
+    case outputMode::IR_RED:
+        print_byte_array_uint16(ir_data);
+        std::cout << " ";
+        print_byte_array_uint16(red_data);
+        break;
+    case outputMode::ALL:
+        print_byte_array_uint16(ir_data);
+        std::cout << " ";
+        print_byte_array_uint16(red_data);
+        std::cout << " ";
+        std::cout << std::fixed << std::setprecision(1) << heart_rate;
+        break;
+    }
+    std::cout << std::endl;
 }
 
 void print_byte_array_hex(SimpleBLE::ByteArray array)

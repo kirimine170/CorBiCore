@@ -86,6 +86,65 @@ def rough_bpm(samples: list[int], sample_rate: float) -> float:
     return 60.0 * sample_rate / median_interval
 
 
+def batch_mean(row: dict[str, str], key: str) -> float:
+    samples = parse_samples(row[key])
+    if not samples:
+        return 0.0
+    return statistics.fmean(samples)
+
+
+def stable_segments(rows: list[dict[str, str]]) -> list[tuple[int, int]]:
+    if not rows:
+        return []
+    means = [batch_mean(row, "ir_samples") for row in rows]
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for i in range(1, len(rows)):
+        previous = means[i - 1]
+        current = means[i]
+        unstable = (
+            current < 5000
+            or abs(current - previous) > 1200
+            or abs(current - previous) / max(current, previous, 1.0) > 0.12
+        )
+        if unstable:
+            if i - start >= 8:
+                segments.append((start, i - 1))
+            start = i
+    if len(rows) - start >= 8:
+        segments.append((start, len(rows) - 1))
+    return segments
+
+
+def print_segments(rows: list[dict[str, str]]) -> None:
+    segments = stable_segments(rows)
+    if not segments:
+        print("stable_segments: none")
+        return
+
+    print("stable_segments:")
+    for index, (start, end) in enumerate(segments, start=1):
+        segment_rows = rows[start : end + 1]
+        ir = flatten_batches(segment_rows, "ir_samples")
+        red = flatten_batches(segment_rows, "red_samples")
+        sample_rate = estimate_sample_rate(segment_rows)
+        start_ms = int(segment_rows[0]["timestamp_ms"])
+        end_ms = int(segment_rows[-1]["timestamp_ms"])
+        duration = (end_ms - start_ms) / 1000.0
+        print(
+            f"  #{index}: batches={start}-{end} duration={duration:.1f}s "
+            f"sample_rate={sample_rate:.2f}Hz rough_ir_bpm={rough_bpm(ir, sample_rate):.1f}"
+        )
+        print(
+            f"      IR mean={statistics.fmean(ir):.1f} span={max(ir) - min(ir)} "
+            f"stdev={statistics.pstdev(ir):.2f}"
+        )
+        print(
+            f"      RED mean={statistics.fmean(red):.1f} span={max(red) - min(red)} "
+            f"stdev={statistics.pstdev(red):.2f}"
+        )
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("Usage: analyze_log.py path/to/corbi.tsv", file=sys.stderr)
@@ -105,6 +164,7 @@ def main() -> int:
     describe("IR", ir)
     describe("RED", red)
     print(f"rough_ir_bpm={rough_bpm(ir, sample_rate):.1f}")
+    print_segments(rows)
     return 0
 
 

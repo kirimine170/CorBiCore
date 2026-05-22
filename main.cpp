@@ -8,6 +8,9 @@
 #include <numeric>
 #include <atomic>
 #include <algorithm>
+#include <fstream>
+#include <chrono>
+#include <sstream>
 
 #include <simpleble/SimpleBLE.h>
 
@@ -26,6 +29,9 @@ SimpleBLE::Peripheral findCorBi(SimpleBLE::Adapter adaper);
 std::vector<uint16_t> decode_uint16_samples(const SimpleBLE::ByteArray &array);
 bool setOutputMode(const std::string &input);
 void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, double heart_rate);
+void write_log_data(const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate);
+std::string samples_to_csv(const std::vector<uint16_t> &samples);
+uint64_t now_ms();
 // TODO 接続周りはコールバックに変更。
 // TODO エラーハンドリングしっかり。
 
@@ -39,6 +45,7 @@ enum class outputMode
 
 SimpleBLE::Peripheral CorBiReader;
 std::atomic<outputMode> mode{outputMode::ALL};
+std::ofstream logFile;
 
 class HeartRateEstimator
 {
@@ -263,9 +270,25 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (arg == "--log" && i + 1 < argc)
+        {
+            logFile.open(argv[++i], std::ios::out | std::ios::trunc);
+            if (!logFile.is_open())
+            {
+                std::cerr << "Failed to open log file: " << argv[i] << std::endl;
+                return 1;
+            }
+            logFile << "timestamp_ms\tbpm\tir_samples\tred_samples" << std::endl;
+            std::cerr << "Logging samples to: " << argv[i] << std::endl;
+        }
+        else if (arg == "--log")
+        {
+            std::cerr << "Usage: CorBiCore [--mode all|ir|red|ir-red] [--log path]" << std::endl;
+            return 1;
+        }
         else if (!setOutputMode(arg))
         {
-            std::cerr << "Usage: CorBiCore [--mode all|ir|red|ir-red]" << std::endl;
+            std::cerr << "Usage: CorBiCore [--mode all|ir|red|ir-red] [--log path]" << std::endl;
             return 1;
         }
     }
@@ -324,8 +347,12 @@ int main(int argc, char **argv)
                 SimpleBLE::ByteArray rx_data_IR = CorBiReader.read(SERVICE_PULSEOXIMETER_UUID, CHARA_IR_UUID);
                 if (rx_data_RED != old_data)
                 {
-                    heartRateEstimator.addSamples(decode_uint16_samples(rx_data_IR));
-                    print_current_data(rx_data_IR, rx_data_RED, heartRateEstimator.estimateBpm());
+                    std::vector<uint16_t> ir_samples = decode_uint16_samples(rx_data_IR);
+                    std::vector<uint16_t> red_samples = decode_uint16_samples(rx_data_RED);
+                    heartRateEstimator.addSamples(ir_samples);
+                    const double heartRate = heartRateEstimator.estimateBpm();
+                    print_current_data(rx_data_IR, rx_data_RED, heartRate);
+                    write_log_data(ir_samples, red_samples, heartRate);
                 }
                 old_data = rx_data_RED;
                 // print_byte_array_hex(rx_data);
@@ -403,6 +430,36 @@ void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_d
         break;
     }
     std::cout << std::endl;
+}
+
+void write_log_data(const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate)
+{
+    if (!logFile.is_open())
+        return;
+
+    logFile << now_ms() << "\t"
+            << std::fixed << std::setprecision(1) << heart_rate << "\t"
+            << samples_to_csv(ir_samples) << "\t"
+            << samples_to_csv(red_samples) << std::endl;
+}
+
+std::string samples_to_csv(const std::vector<uint16_t> &samples)
+{
+    std::ostringstream out;
+    for (size_t i = 0; i < samples.size(); i++)
+    {
+        if (i > 0)
+            out << ",";
+        out << samples[i];
+    }
+    return out.str();
+}
+
+uint64_t now_ms()
+{
+    const auto now = std::chrono::system_clock::now();
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch());
+    return static_cast<uint64_t>(millis.count());
 }
 
 void print_byte_array_hex(SimpleBLE::ByteArray array)

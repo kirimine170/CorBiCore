@@ -29,7 +29,7 @@ SimpleBLE::Peripheral findCorBi(SimpleBLE::Adapter adaper);
 std::vector<uint16_t> decode_uint16_samples(const SimpleBLE::ByteArray &array);
 bool setOutputMode(const std::string &input);
 void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_data, double heart_rate);
-void write_log_data(const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate);
+void write_log_data(uint64_t timestampMs, const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate);
 std::string samples_to_csv(const std::vector<uint16_t> &samples);
 uint64_t now_ms();
 // TODO 接続周りはコールバックに変更。
@@ -50,8 +50,9 @@ std::ofstream logFile;
 class HeartRateEstimator
 {
 public:
-    void addSamples(const std::vector<uint16_t> &samples)
+    void addSamples(const std::vector<uint16_t> &samples, uint64_t timestampMs)
     {
+        updateSampleRate(samples.size(), timestampMs);
         for (uint16_t sample : samples)
         {
             processSample(sample);
@@ -63,21 +64,27 @@ public:
         if (sampleIndex < MIN_SAMPLES || quality < MIN_QUALITY)
             return 0.0;
 
+        const double spectralBpm = estimateSpectralBpm();
         const size_t samplesSinceBeat = sampleIndex - lastBeatSample;
-        if (lastBeatSample == 0 || samplesSinceBeat > MAX_STALE_SAMPLES)
-            return 0.0;
+        if (lastBeatSample == 0 || samplesSinceBeat > maxStaleSamples())
+            return spectralBpm;
 
+        if (spectralBpm > 0.0 && smoothedBpm > 0.0)
+        {
+            const double high = std::max(spectralBpm, smoothedBpm);
+            const double low = std::min(spectralBpm, smoothedBpm);
+            if (high / low > 1.35)
+                return spectralBpm;
+        }
         return smoothedBpm;
     }
 
 private:
-    static constexpr double SAMPLE_RATE_HZ = 100.0;
-    static constexpr size_t MIN_SAMPLES = 180;
+    static constexpr double DEFAULT_SAMPLE_RATE_HZ = 100.0;
+    static constexpr double SAMPLE_RATE_ALPHA = 0.15;
+    static constexpr size_t MIN_SAMPLES = 160;
     static constexpr size_t WINDOW_SIZE = 400;
     static constexpr size_t MAX_INTERVALS = 8;
-    static constexpr size_t MIN_BEAT_INTERVAL = static_cast<size_t>(SAMPLE_RATE_HZ * 60.0 / 220.0);
-    static constexpr size_t MAX_BEAT_INTERVAL = static_cast<size_t>(SAMPLE_RATE_HZ * 60.0 / 38.0);
-    static constexpr size_t MAX_STALE_SAMPLES = static_cast<size_t>(SAMPLE_RATE_HZ * 3.0);
     static constexpr int MIN_BPM = 40;
     static constexpr int MAX_BPM = 220;
     static constexpr double MIN_QUALITY = 0.16;
@@ -85,6 +92,25 @@ private:
     static constexpr double FILTER_ALPHA = 0.18;
     static constexpr double THRESHOLD_SCALE = 0.30;
     static constexpr double BPM_SMOOTHING = 0.28;
+    static constexpr double RAW_JUMP_RATIO = 0.12;
+    static constexpr double RAW_JUMP_MIN = 1200.0;
+
+    void updateSampleRate(size_t sampleCount, uint64_t timestampMs)
+    {
+        if (sampleCount == 0)
+            return;
+
+        if (lastBatchTimestampMs != 0 && timestampMs > lastBatchTimestampMs)
+        {
+            const double elapsedSeconds = static_cast<double>(timestampMs - lastBatchTimestampMs) / 1000.0;
+            const double measuredRate = static_cast<double>(sampleCount) / elapsedSeconds;
+            if (measuredRate >= 40.0 && measuredRate <= 140.0)
+            {
+                sampleRateHz = sampleRateHz + SAMPLE_RATE_ALPHA * (measuredRate - sampleRateHz);
+            }
+        }
+        lastBatchTimestampMs = timestampMs;
+    }
 
     void processSample(uint16_t raw)
     {
@@ -96,6 +122,12 @@ private:
             initialized = true;
         }
 
+        if (isContactJump(sample))
+        {
+            resetSignal(sample);
+            return;
+        }
+
         dc += DC_ALPHA * (sample - dc);
         filtered += FILTER_ALPHA * ((sample - dc) - filtered);
 
@@ -105,6 +137,30 @@ private:
 
         updateQuality();
         detectBeat(filtered);
+    }
+
+    bool isContactJump(double sample) const
+    {
+        if (!initialized || stableSamples < MIN_SAMPLES / 2)
+            return false;
+
+        const double jump = std::abs(sample - dc);
+        const double allowedJump = std::max(RAW_JUMP_MIN, std::abs(dc) * RAW_JUMP_RATIO);
+        return jump > allowedJump;
+    }
+
+    void resetSignal(double sample)
+    {
+        dc = sample;
+        filtered = 0.0;
+        previous = 0.0;
+        previousPrevious = 0.0;
+        adaptiveThreshold = 120.0;
+        quality = 0.0;
+        stableSamples = 0;
+        lastBeatSample = 0;
+        filteredWindow.clear();
+        beatIntervals.clear();
     }
 
     void updateQuality()
@@ -139,18 +195,20 @@ private:
         {
             previousPrevious = previous;
             previous = current;
+            stableSamples = filteredWindow.size();
             return;
         }
+        stableSamples = filteredWindow.size();
 
         const bool localMaximum = previous > previousPrevious && previous >= current;
         const bool strongEnough = previous > adaptiveThreshold;
         const size_t candidateSample = sampleIndex - 1;
         const size_t interval = lastBeatSample == 0 ? 0 : candidateSample - lastBeatSample;
-        const bool outsideRefractory = lastBeatSample == 0 || interval >= MIN_BEAT_INTERVAL;
+        const bool outsideRefractory = lastBeatSample == 0 || interval >= minBeatInterval();
 
         if (localMaximum && strongEnough && outsideRefractory)
         {
-            if (lastBeatSample == 0 || interval <= MAX_BEAT_INTERVAL)
+            if (lastBeatSample == 0 || interval <= maxBeatInterval())
             {
                 acceptBeat(candidateSample, interval);
             }
@@ -168,17 +226,39 @@ private:
             return;
         }
 
-        const double intervalBpm = 60.0 * SAMPLE_RATE_HZ / static_cast<double>(interval);
-        if (intervalBpm >= MIN_BPM && intervalBpm <= MAX_BPM && isConsistent(interval))
+        const double intervalBpm = 60.0 * sampleRateHz / static_cast<double>(interval);
+        const double correctedBpm = correctHarmonic(intervalBpm);
+        const size_t correctedInterval = static_cast<size_t>(std::round(60.0 * sampleRateHz / correctedBpm));
+        if (correctedBpm >= MIN_BPM && correctedBpm <= MAX_BPM && isConsistent(correctedInterval))
         {
-            beatIntervals.push_back(interval);
+            beatIntervals.push_back(correctedInterval);
             if (beatIntervals.size() > MAX_INTERVALS)
                 beatIntervals.pop_front();
 
-            const double bpm = 60.0 * SAMPLE_RATE_HZ / medianInterval();
+            const double bpm = 60.0 * sampleRateHz / medianInterval();
             smoothedBpm = smoothedBpm == 0.0 ? bpm : smoothedBpm + BPM_SMOOTHING * (bpm - smoothedBpm);
             lastBeatSample = beatSample;
         }
+    }
+
+    double correctHarmonic(double bpm) const
+    {
+        if (smoothedBpm <= 0.0)
+        {
+            if (bpm > 135.0)
+                return bpm / 2.0;
+            return bpm;
+        }
+
+        const double half = bpm / 2.0;
+        if (bpm > smoothedBpm * 1.55 && half > MIN_BPM && std::abs(half - smoothedBpm) < std::abs(bpm - smoothedBpm))
+            return half;
+
+        const double doubled = bpm * 2.0;
+        if (bpm < smoothedBpm * 0.65 && doubled < MAX_BPM && std::abs(doubled - smoothedBpm) < std::abs(bpm - smoothedBpm))
+            return doubled;
+
+        return bpm;
     }
 
     bool isConsistent(size_t interval) const
@@ -188,7 +268,7 @@ private:
 
         const double median = medianInterval();
         const double deviation = std::abs(static_cast<double>(interval) - median) / median;
-        return deviation < 0.35;
+        return deviation < 0.28;
     }
 
     double intervalConsistency() const
@@ -203,7 +283,7 @@ private:
             error += std::abs(static_cast<double>(interval) - median) / median;
         }
         error /= beatIntervals.size();
-        return clamp(1.0 - (error / 0.22), 0.0, 1.0);
+        return clamp(1.0 - (error / 0.18), 0.0, 1.0);
     }
 
     double medianInterval() const
@@ -216,14 +296,63 @@ private:
         return static_cast<double>(intervals[middle]);
     }
 
+    double estimateSpectralBpm() const
+    {
+        if (filteredWindow.size() < MIN_SAMPLES)
+            return 0.0;
+
+        const double mean = std::accumulate(filteredWindow.begin(), filteredWindow.end(), 0.0) / filteredWindow.size();
+        double bestBpm = 0.0;
+        double bestPower = 0.0;
+        for (int bpm = 45; bpm <= 140; bpm++)
+        {
+            const double frequency = static_cast<double>(bpm) / 60.0;
+            double real = 0.0;
+            double imag = 0.0;
+            for (size_t i = 0; i < filteredWindow.size(); i++)
+            {
+                const double window = 0.5 - 0.5 * std::cos((2.0 * M_PI * i) / static_cast<double>(filteredWindow.size() - 1));
+                const double sample = (filteredWindow[i] - mean) * window;
+                const double angle = 2.0 * M_PI * frequency * static_cast<double>(i) / sampleRateHz;
+                real += sample * std::cos(angle);
+                imag -= sample * std::sin(angle);
+            }
+            const double power = real * real + imag * imag;
+            if (power > bestPower)
+            {
+                bestPower = power;
+                bestBpm = static_cast<double>(bpm);
+            }
+        }
+        return bestBpm;
+    }
+
     static double clamp(double value, double minValue, double maxValue)
     {
         return std::min(maxValue, std::max(minValue, value));
     }
 
+    size_t minBeatInterval() const
+    {
+        return static_cast<size_t>(sampleRateHz * 60.0 / MAX_BPM);
+    }
+
+    size_t maxBeatInterval() const
+    {
+        return static_cast<size_t>(sampleRateHz * 60.0 / MIN_BPM);
+    }
+
+    size_t maxStaleSamples() const
+    {
+        return static_cast<size_t>(sampleRateHz * 3.0);
+    }
+
     bool initialized = false;
     size_t sampleIndex = 0;
     size_t lastBeatSample = 0;
+    size_t stableSamples = 0;
+    uint64_t lastBatchTimestampMs = 0;
+    double sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     double dc = 0.0;
     double filtered = 0.0;
     double previous = 0.0;
@@ -347,12 +476,13 @@ int main(int argc, char **argv)
                 SimpleBLE::ByteArray rx_data_IR = CorBiReader.read(SERVICE_PULSEOXIMETER_UUID, CHARA_IR_UUID);
                 if (rx_data_RED != old_data)
                 {
+                    const uint64_t timestampMs = now_ms();
                     std::vector<uint16_t> ir_samples = decode_uint16_samples(rx_data_IR);
                     std::vector<uint16_t> red_samples = decode_uint16_samples(rx_data_RED);
-                    heartRateEstimator.addSamples(ir_samples);
+                    heartRateEstimator.addSamples(ir_samples, timestampMs);
                     const double heartRate = heartRateEstimator.estimateBpm();
                     print_current_data(rx_data_IR, rx_data_RED, heartRate);
-                    write_log_data(ir_samples, red_samples, heartRate);
+                    write_log_data(timestampMs, ir_samples, red_samples, heartRate);
                 }
                 old_data = rx_data_RED;
                 // print_byte_array_hex(rx_data);
@@ -432,12 +562,12 @@ void print_current_data(SimpleBLE::ByteArray ir_data, SimpleBLE::ByteArray red_d
     std::cout << std::endl;
 }
 
-void write_log_data(const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate)
+void write_log_data(uint64_t timestampMs, const std::vector<uint16_t> &ir_samples, const std::vector<uint16_t> &red_samples, double heart_rate)
 {
     if (!logFile.is_open())
         return;
 
-    logFile << now_ms() << "\t"
+    logFile << timestampMs << "\t"
             << std::fixed << std::setprecision(1) << heart_rate << "\t"
             << samples_to_csv(ir_samples) << "\t"
             << samples_to_csv(red_samples) << std::endl;

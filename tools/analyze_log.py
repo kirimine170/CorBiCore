@@ -145,14 +145,11 @@ def print_segments(rows: list[dict[str, str]]) -> None:
         )
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: analyze_log.py path/to/corbi.tsv", file=sys.stderr)
-        return 1
-    path = Path(sys.argv[1])
+def analyze(path: Path) -> int:
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     if not rows:
+        print(f"file: {path}")
         print("No rows found")
         return 1
 
@@ -166,6 +163,19 @@ def main() -> int:
     print(f"rough_ir_bpm={rough_bpm(ir, sample_rate):.1f}")
     print_segments(rows)
     return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: analyze_log.py path/to/corbi.tsv [more.tsv ...]", file=sys.stderr)
+        return 1
+
+    status = 0
+    for index, arg in enumerate(sys.argv[1:]):
+        if index > 0:
+            print()
+        status = max(status, analyze(Path(arg)))
+    return status
 
 
 if __name__ == "__main__":
